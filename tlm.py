@@ -13,6 +13,8 @@ import json
 import threading
 import shutil
 import time
+import tempfile
+import zipfile
 from pathlib import Path
 from io import BytesIO
 
@@ -406,6 +408,85 @@ class WorkshopAPI:
             except Exception:
                 self._installed = {}
 
+    def _resolve_tld_path(self) -> str:
+        tld_path = self.config.get("tld_path", "")
+        if tld_path:
+            return os.path.abspath(os.path.expanduser(tld_path))
+
+        home = os.path.expanduser("~")
+        candidates = [
+            os.path.join(home, ".steam", "steam", "steamapps", "common", "The Long Drive"),
+            os.path.join(home, ".local", "share", "Steam", "steamapps", "common", "The Long Drive"),
+        ]
+        for candidate in candidates:
+            if os.path.isdir(candidate):
+                return candidate
+
+        return os.path.abspath(".")
+
+    def _mods_dir(self) -> str:
+        return os.path.join(self._resolve_tld_path(), "Mods")
+
+    def _normalize_installed_entry(self, mod: Mod) -> dict:
+        raw = self._installed.get(mod.file_name, {})
+        if isinstance(raw, str):
+            return {"version": raw, "install_path": "", "archive": mod.file_name}
+        if isinstance(raw, dict):
+            return {
+                "version": raw.get("version", ""),
+                "install_path": raw.get("install_path", ""),
+                "archive": raw.get("archive", mod.file_name),
+            }
+        return {"version": "", "install_path": "", "archive": mod.file_name}
+
+    def ensure_loader(self) -> None:
+        tld_root = self._resolve_tld_path()
+        mods_dir = os.path.join(tld_root, "Mods")
+        melon_dir = os.path.join(tld_root, "MelonLoader")
+        os.makedirs(mods_dir, exist_ok=True)
+        os.makedirs(melon_dir, exist_ok=True)
+
+        loader_path = os.path.join(tld_root, "TLDLoader.dll")
+        if os.path.exists(loader_path):
+            return
+
+        response = requests.get(TLD_LOADER_URL, timeout=30)
+        response.raise_for_status()
+        with open(loader_path, "wb") as f:
+            f.write(response.content)
+
+    def _extract_archive(self, archive_path: str, mod: Mod) -> str:
+        mods_dir = self._mods_dir()
+        tld_root = self._resolve_tld_path()
+        os.makedirs(mods_dir, exist_ok=True)
+
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            members = [name for name in zf.namelist() if name and not name.endswith("/")]
+            if not members:
+                raise ValueError(f"Archive for '{mod.name}' is empty.")
+
+            top_levels = {name.split("/", 1)[0] for name in members if "/" in name}
+            has_root_files = any("/" not in name for name in members)
+
+            if any(name.startswith("Mods/") or name.startswith("MelonLoader/") for name in members):
+                zf.extractall(tld_root)
+                return os.path.join(mods_dir, mod.name)
+
+            if len(top_levels) == 1 and not has_root_files:
+                top = next(iter(top_levels))
+                if top.lower() in {"mods", "melonloader"}:
+                    zf.extractall(tld_root)
+                    return os.path.join(mods_dir, mod.name)
+                zf.extractall(mods_dir)
+                return os.path.join(mods_dir, top)
+
+            target = os.path.join(mods_dir, mod.name)
+            if os.path.isdir(target):
+                shutil.rmtree(target)
+            os.makedirs(target, exist_ok=True)
+            zf.extractall(target)
+            return target
+
     def _save_installed(self):
         with open(MODS_STORE_FILE, "w") as f:
             json.dump(self._installed, f, indent=2)
@@ -435,7 +516,7 @@ class WorkshopAPI:
         return mod.file_name in self._installed
 
     def installed_version(self, mod: Mod) -> str:
-        return self._installed.get(mod.file_name, "")
+        return self._normalize_installed_entry(mod).get("version", "")
 
     def has_update(self, mod: Mod) -> bool:
         iv = self.installed_version(mod)
@@ -448,10 +529,10 @@ class WorkshopAPI:
         return [m for m in self._mods_cache if self.has_update(m)]
 
     def download(self, mod: Mod, progress_cb=None) -> None:
-        tld_path = self.config.get("tld_path", "")
-        mods_dir = os.path.join(tld_path, "Mods") if tld_path else "Mods"
-        os.makedirs(mods_dir, exist_ok=True)
-        dest = os.path.join(mods_dir, mod.file_name)
+        self.ensure_loader()
+
+        with tempfile.NamedTemporaryFile(prefix="tlm_", suffix=".zip", delete=False) as tmp:
+            dest = tmp.name
 
         with requests.get(mod.link, stream=True, timeout=30) as r:
             r.raise_for_status()
@@ -464,15 +545,29 @@ class WorkshopAPI:
                     if progress_cb and total:
                         progress_cb(int(done * 100 / total))
 
-        self._installed[mod.file_name] = mod.version
+        install_path = self._extract_archive(dest, mod)
+        os.remove(dest)
+
+        self._installed[mod.file_name] = {
+            "version": mod.version,
+            "install_path": install_path,
+            "archive": mod.file_name,
+        }
         self._save_installed()
 
     def uninstall(self, mod: Mod) -> None:
-        tld_path = self.config.get("tld_path", "")
-        mods_dir = os.path.join(tld_path, "Mods") if tld_path else "Mods"
-        dest = os.path.join(mods_dir, mod.file_name)
-        if os.path.exists(dest):
-            os.remove(dest)
+        entry = self._normalize_installed_entry(mod)
+        install_path = entry.get("install_path", "")
+        if install_path and os.path.exists(install_path):
+            if os.path.isdir(install_path):
+                shutil.rmtree(install_path)
+            else:
+                os.remove(install_path)
+
+        legacy_archive = os.path.join(self._mods_dir(), mod.file_name)
+        if os.path.exists(legacy_archive):
+            os.remove(legacy_archive)
+
         self._installed.pop(mod.file_name, None)
         self._save_installed()
 
